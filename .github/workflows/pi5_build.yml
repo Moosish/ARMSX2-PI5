@@ -1,0 +1,166 @@
+name: Raspberry Pi 5 Build
+
+# A Linux arm64 AppImage tuned for the Raspberry Pi 5 (Cortex-A76, 4K pages, 64-byte lines).
+# Differs from linux_build_qt.yml in three ways:
+#   * the compiler targets ARMv8.2 with Cortex-A76 tuning instead of the generic ARMv8.1 default,
+#   * the clang version is selectable (newer clang generates better arm64 code),
+#   * clang instrumentation PGO: `generate` builds an instrumented AppImage to train on the Pi,
+#     `use` merges the raw profiles committed under pgo/ and optimises against them.
+# The PGO switches in cmake/BuildParameters.cmake are GCC-style and do not link under clang, so
+# this workflow passes clang's flags itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pgo:
+        description: "PGO mode"
+        type: choice
+        options: [none, generate, use]
+        default: none
+      clang:
+        description: "clang major version"
+        type: string
+        default: "19"
+      tune:
+        description: "Tune for Cortex-A76 (off = upstream generic flags, for A/B)"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Pi 5 AppImage (pgo=${{ inputs.pgo }}, clang-${{ inputs.clang }}, tune=${{ inputs.tune }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: true
+      CCACHE_COMPRESSLEVEL: 9
+      CCACHE_MAXSIZE: 500M
+      CLANG_VER: ${{ inputs.clang }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Artifact name
+        id: meta
+        shell: bash
+        run: |
+          tune=$([ "${{ inputs.tune }}" = "true" ] && echo a76 || echo generic)
+          echo "name=armsx2-pi5-$(git rev-parse --short HEAD)-${tune}-clang${CLANG_VER}-pgo-${{ inputs.pgo }}" >> "$GITHUB_OUTPUT"
+
+      - name: ccache cache files
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          # PGO and tuning change every object, so they get their own cache lines.
+          key: pi5 clang${{ inputs.clang }} ${{ inputs.tune }} ${{ inputs.pgo }} ccache ${{ github.run_id }}
+          restore-keys: pi5 clang${{ inputs.clang }} ${{ inputs.tune }} ${{ inputs.pgo }} ccache
+
+      - name: Install Packages
+        run: |
+          tools/retry.sh wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          sudo tools/retry.sh apt-add-repository -n "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-${CLANG_VER} main"
+          sudo tools/retry.sh apt-get -o Acquire::ForceIPv4=true update
+          sudo tools/retry.sh apt-get -y install \
+            build-essential ccache clang-${CLANG_VER} cmake curl extra-cmake-modules git libasound2-dev libaio-dev \
+            libcurl4-openssl-dev libdbus-1-dev libdecor-0-dev libegl-dev libevdev-dev libfontconfig-dev libfreetype-dev libfuse2 libgtk-3-dev libgudev-1.0-dev \
+            libharfbuzz-dev libinput-dev libopengl-dev libopus-dev libpcap-dev libpipewire-0.3-dev libpulse-dev libssl-dev libudev-dev libva-dev \
+            libwayland-dev libx11-dev libx11-xcb-dev libx264-dev libxcb1-dev libxcb-composite0-dev libxcb-cursor-dev libxcb-damage0-dev libxcb-glx0-dev libxcb-icccm4-dev \
+            libxcb-image0-dev libxcb-keysyms1-dev libxcb-present-dev libxcb-randr0-dev libxcb-render0-dev libxcb-render-util0-dev libxcb-shape0-dev \
+            libxcb-shm0-dev libxcb-sync-dev libxcb-util-dev libxcb-xfixes0-dev libxcb-xinput-dev libxcb-xkb-dev libxext-dev libxkbcommon-x11-dev libxrandr-dev \
+            lld-${CLANG_VER} llvm-${CLANG_VER} nasm ninja-build patchelf pkg-config zlib1g-dev aria2
+
+      # Same key as linux_build_qt.yml: the dependencies are built with the system compiler and do not
+      # depend on our flags, so the upstream cache is reusable.
+      - name: Cache Dependencies
+        id: cache-deps
+        uses: actions/cache@v6
+        with:
+          path: ~/deps
+          key: ubuntu-24.04-arm arm64 deps ${{ hashFiles('.github/workflows/scripts/linux/build-dependencies-qt.sh', '.github/workflows/scripts/common/*.patch') }}
+
+      - name: Build Dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: .github/workflows/scripts/linux/build-dependencies-qt.sh "$HOME/deps"
+
+      - name: Download patches
+        run: |
+          cd bin/resources
+          aria2c -Z "https://github.com/isztldav/pcsx2_patches/releases/latest/download/patches.zip"
+
+      - name: Merge PGO profiles
+        if: inputs.pgo == 'use'
+        run: |
+          shopt -s nullglob
+          raws=(pgo/*.profraw)
+          if [ ${#raws[@]} -eq 0 ]; then echo "::error::pgo=use but no pgo/*.profraw committed"; exit 1; fi
+          "llvm-profdata-${CLANG_VER}" merge -o "$GITHUB_WORKSPACE/armsx2.profdata" "${raws[@]}"
+          "llvm-profdata-${CLANG_VER}" show "$GITHUB_WORKSPACE/armsx2.profdata" | tail -5
+
+      - name: Generate CMake
+        shell: bash
+        run: |
+          # Built as an array so flags with spaces survive intact (linux_build_qt.yml word-splits
+          # its cmakeflags, which cannot carry a multi-flag CMAKE_CXX_FLAGS).
+          CFLAGS=""
+          LDFLAGS="-fuse-ld=lld"
+          if [ "${{ inputs.tune }}" = "true" ]; then
+            # Cortex-A76 is ARMv8.2-A with FP16, dot product, RCpc and crypto. Supplying -march here
+            # also stops BuildParameters.cmake appending its generic -march=armv8.1-a.
+            CFLAGS="-march=armv8.2-a+fp16+dotprod+rcpc+crypto -mtune=cortex-a76"
+          fi
+          case "${{ inputs.pgo }}" in
+            generate)
+              CFLAGS="$CFLAGS -fprofile-generate"
+              LDFLAGS="$LDFLAGS -fprofile-generate" ;;
+            use)
+              CFLAGS="$CFLAGS -fprofile-use=$GITHUB_WORKSPACE/armsx2.profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
+              LDFLAGS="$LDFLAGS -fprofile-use=$GITHUB_WORKSPACE/armsx2.profdata" ;;
+          esac
+          args=(
+            -B build -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+            -DCMAKE_PREFIX_PATH="$HOME/deps"
+            -DCMAKE_C_COMPILER="clang-${CLANG_VER}"
+            -DCMAKE_CXX_COMPILER="clang++-${CLANG_VER}"
+            -DCMAKE_C_FLAGS="$CFLAGS"
+            -DCMAKE_CXX_FLAGS="$CFLAGS"
+            -DCMAKE_EXE_LINKER_FLAGS_INIT="$LDFLAGS"
+            -DCMAKE_MODULE_LINKER_FLAGS_INIT="$LDFLAGS"
+            -DCMAKE_SHARED_LINKER_FLAGS_INIT="$LDFLAGS"
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DENABLE_SETCAP=OFF
+            -DDISABLE_ADVANCE_SIMD=TRUE
+            -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+            -DHOST_PAGE_SIZE=4096
+            -DHOST_CACHE_LINE_SIZE=64
+          )
+          echo "CFLAGS=$CFLAGS"; echo "LDFLAGS=$LDFLAGS"
+          cmake "${args[@]}"
+
+      - name: Build ARMSX2
+        working-directory: build
+        run: |
+          ccache -z
+          ninja
+          ccache -s
+
+      - name: Package AppImage
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          .github/workflows/scripts/linux/appimage-qt.sh "$(realpath .)" "$(realpath ./build)" "$HOME/deps" "$NAME"
+          mkdir -p ci-artifacts
+          mv "${NAME}.AppImage" ci-artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: ci-artifacts
