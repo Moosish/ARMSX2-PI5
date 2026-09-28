@@ -25,6 +25,10 @@ on:
         description: "Tune for Cortex-A76 (off = upstream generic flags, for A/B)"
         type: boolean
         default: true
+      gsrunner:
+        description: "Also build pcsx2-gsrunner (GS dump replay/profiling tool)"
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -143,6 +147,7 @@ jobs:
             -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
             -DHOST_PAGE_SIZE=4096
             -DHOST_CACHE_LINE_SIZE=64
+            -DENABLE_GSRUNNER=${{ inputs.gsrunner && 'ON' || 'OFF' }}
           )
           echo "CFLAGS=$CFLAGS"; echo "LDFLAGS=$LDFLAGS"
           cmake "${args[@]}"
@@ -179,3 +184,16 @@ jobs:
             gh release create pi5-builds --prerelease --title "Raspberry Pi 5 builds" \
               --notes "AppImages from pi5_build.yml. Filenames say the commit, tuning, clang version and PGO mode."
           gh release upload pi5-builds "ci-artifacts/${NAME}.AppImage" --clobber
+
+      # gsrunner is not in the AppImage. It links the same core, so on the Pi it runs from the
+      # extracted AppImage's usr/bin (for resources/) with that AppImage's usr/lib on the library path.
+      - name: Publish gsrunner
+        if: inputs.gsrunner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          bin=$(find build -name pcsx2-gsrunner -type f -perm -u+x | head -1)
+          [ -n "$bin" ] || { echo "::error::pcsx2-gsrunner not built"; exit 1; }
+          cp "$bin" "ci-artifacts/${NAME}-gsrunner"
+          gh release upload pi5-builds "ci-artifacts/${NAME}-gsrunner" --clobber
