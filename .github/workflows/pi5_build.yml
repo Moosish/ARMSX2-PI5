@@ -30,6 +30,9 @@ jobs:
   build:
     name: Pi 5 AppImage (pgo=${{ inputs.pgo }}, clang-${{ inputs.clang }}, tune=${{ inputs.tune }})
     runs-on: ubuntu-24.04-arm
+    # contents: write lets the last step attach the AppImage to the rolling pi5-builds release.
+    permissions:
+      contents: write
     timeout-minutes: 120
     env:
       CCACHE_BASEDIR: ${{ github.workspace }}
@@ -164,3 +167,15 @@ jobs:
         with:
           name: ${{ steps.meta.outputs.name }}
           path: ci-artifacts
+
+      # Workflow artifacts need a signed-in download; a release asset does not, so the Pi can
+      # fetch builds directly. One rolling prerelease, assets replaced by name on re-runs.
+      - name: Publish to pi5-builds release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          gh release view pi5-builds >/dev/null 2>&1 || \
+            gh release create pi5-builds --prerelease --title "Raspberry Pi 5 builds" \
+              --notes "AppImages from pi5_build.yml. Filenames say the commit, tuning, clang version and PGO mode."
+          gh release upload pi5-builds "ci-artifacts/${NAME}.AppImage" --clobber
